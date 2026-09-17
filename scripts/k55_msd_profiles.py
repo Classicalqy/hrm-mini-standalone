@@ -1,4 +1,4 @@
-"""K55 checkpoint discovery, best-epoch selection, and L-depth MSD profiles."""
+"""K55 checkpoint discovery, configurable epoch selection, and L-depth MSD profiles."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
 import numpy as np
 import torch
@@ -212,6 +213,25 @@ def make_loader(run: RunDirectory, requested_band: str):
     return loader, {"vocab_size": 10, "seq_len": 82, "is_causal": False}
 
 
+def last_k55_checkpoints(runs: list[RunDirectory]) -> list[dict[str, object]]:
+    """Select the highest numbered checkpoint present for every K55 run."""
+    selected: list[dict[str, object]] = []
+    completed = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for run in runs:
+        checkpoints = epoch_checkpoints(run.directory)
+        if not checkpoints:
+            raise FileNotFoundError(f"No epoch checkpoints found in {run.directory}.")
+        epoch, checkpoint = checkpoints[-1]
+        selected.append({
+            "kind": run.kind, "condition": run.condition, "readout": run.readout,
+            "train_l": "" if run.l_cycles is None else run.l_cycles, "seed": run.seed,
+            "epoch": epoch, "checkpoint": str(checkpoint), "test_exact_match": "",
+            "cell_accuracy": "", "evaluated_examples": 0, "selection_policy": "last",
+            "selection_completed": completed,
+        })
+    return selected
+
+
 def select_k55_best(runs: list[RunDirectory], output_dir: Path, device: torch.device, split: str) -> list[dict[str, object]]:
     """Select one native-schedule epoch independently for every condition and seed."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +240,9 @@ def select_k55_best(runs: list[RunDirectory], output_dir: Path, device: torch.de
     existing = {
         (row["condition"], int(row["seed"])): dict(row)
         for row in read_csv(destination)
-        if (row["condition"], int(row["seed"])) in expected and Path(row["checkpoint"]).is_file()
+        if (row["condition"], int(row["seed"])) in expected
+        and row.get("selection_policy", "best") in ("", "best")
+        and Path(row["checkpoint"]).is_file()
     }
     pending = [run for run in runs if (run.condition, run.seed) not in existing]
     progress = tqdm(total=sum(len(epoch_checkpoints(run.directory)) for run in pending), desc="Select K55 best checkpoints", unit="epoch")
@@ -240,6 +262,7 @@ def select_k55_best(runs: list[RunDirectory], output_dir: Path, device: torch.de
                 "train_l": "" if run.l_cycles is None else run.l_cycles, "seed": run.seed,
                 "epoch": epoch, "checkpoint": str(checkpoint), "test_exact_match": exact,
                 "cell_accuracy": cell, "evaluated_examples": examples,
+                "selection_policy": "best",
                 "selection_completed": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
             if best is None or exact > float(best["test_exact_match"]):
@@ -266,7 +289,19 @@ def k55_units(runs: list[RunDirectory], l_values: tuple[int, ...]) -> list[Sweep
 
 def _comparison_figures(output_dir: Path, args: Any) -> None:
     metadata = read_csv(output_dir / "rollout_metadata.csv")
-    segment_colors = plt.get_cmap("tab10")
+    # Exact vector colors used for the corresponding models in HRM Nature Fig. 2.
+    model_colors = {
+        "hrm": "#3a86ff",
+        "trm": "#fb5607",
+        "hrm_l1": "#8338ec",
+        "rt": "#ffbe0b",
+    }
+    segment_white_mix = (.36, .24, .12, 0.)
+
+    def model_segment_color(model_name: str, segment: int) -> tuple[float, float, float]:
+        base = np.asarray(to_rgb(model_colors[model_name]))
+        mix = segment_white_mix[segment]
+        return tuple((1 - mix) * base + mix * np.ones(3))
 
     def seed1_curve(condition: str, eval_l: int, state: str, segment: int) -> tuple[np.ndarray, np.ndarray]:
         seed_ids = sorted(
@@ -278,10 +313,14 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         lags, _mean, _low, _high, seed_curves = curve(metadata, condition, eval_l, state, segment)
         return lags, seed_curves[seed_ids.index(1)]
 
-    def configure_msd_axis(axis: Any, condition: str, eval_l: int, title: str) -> None:
+    def configure_msd_axis(
+        axis: Any, condition: str, eval_l: int, model_name: str, title: str,
+    ) -> None:
         for segment in range(4):
-            color = segment_colors(segment)
-            for state, style, marker, width in (("h", "-", "o", 2.0), ("l", "--", "^", 1.8)):
+            color = model_segment_color(model_name, segment)
+            for state, style, marker, width in (
+                ("h", "-", "o", 2.5), ("l", (0, (7, 3)), "^", 2.2),
+            ):
                 lags, values = seed1_curve(condition, eval_l, state, segment)
                 plot_lags = lags
                 defined = values > 0
@@ -290,9 +329,12 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
                     # first complete H period, but hide its initial sub-cycle line.
                     defined &= lags >= eval_l
                 plotted = np.where(defined, values, np.nan)
-                axis.plot(plot_lags, plotted, style, color=color, marker=marker, markersize=3.2,
+                marker_size = 4.0 if state == "h" else 4.5
+                axis.plot(plot_lags, plotted, color=color, linestyle=style, marker=marker,
+                          markersize=marker_size,
                           markerfacecolor=color if state == "h" else "white",
-                          markeredgewidth=.8, linewidth=width, zorder=3 if state == "h" else 2)
+                          markeredgecolor=color, markeredgewidth=1.15, linewidth=width,
+                          zorder=3 if state == "h" else 2)
         axis.set_xscale("log", base=2)
         axis.set_yscale("log", base=2)
         axis.grid(alpha=.2, which="both")
@@ -302,7 +344,8 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         condition = condition_name("easy", "rt")
         for segment in range(4):
             lags, values = seed1_curve(condition, 1, "rt", segment)
-            axis.plot(lags, np.where(values > 0, values, np.nan), ":", color=segment_colors(segment),
+            axis.plot(lags, np.where(values > 0, values, np.nan), ":",
+                      color=model_segment_color("rt", segment),
                       marker="s", markersize=3, linewidth=1.9)
         axis.set_xscale("log", base=2)
         axis.set_yscale("log", base=2)
@@ -321,27 +364,33 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         return h_lags, ratio
 
     def configure_ratio_axis(
-        axis: Any, condition: str, eval_l: int, model_label: str, title: str,
+        axis: Any, condition: str, eval_l: int, model_name: str, model_label: str, title: str,
     ) -> None:
         h2l1_condition = condition_name("easy", "hrm_h2l1")
         for segment in range(4):
             h_lags, ratio = ratio_curve(condition, eval_l, segment)
             axis.plot(
-                h_lags, ratio, color=segment_colors(segment), marker="D", markersize=3,
-                linewidth=2.0, label=model_label if segment == 0 else None,
+                h_lags, ratio, color=model_segment_color(model_name, segment),
+                marker="D", markersize=3, linewidth=2.1,
             )
             control_lags, control_ratio = ratio_curve(h2l1_condition, 1, segment)
             axis.plot(
-                control_lags, control_ratio, "--", color=segment_colors(segment), marker="x",
-                markersize=3.2, linewidth=1.25, alpha=.72,
-                label="H2L1" if segment == 0 else None,
+                control_lags, control_ratio, color=model_segment_color("hrm_l1", segment),
+                linestyle=(0, (5, 2)), marker="x", markersize=3.4, linewidth=1.8,
             )
         axis.axhline(1, color="0.35", linestyle=":", linewidth=1)
         axis.set_xscale("log", base=2)
         axis.set_yscale("log", base=2)
         axis.grid(alpha=.2, which="both")
         axis.set_title(title)
-        axis.legend(loc="best", fontsize=7, frameon=False)
+        ratio_handles = [
+            Line2D([0], [0], color=model_colors[model_name], linestyle="-", marker="D",
+                   linewidth=2.2, label=model_label),
+            Line2D([0], [0], color=model_colors["hrm_l1"], linestyle=(0, (5, 2)), marker="x",
+                   linewidth=2.2, label="HRM (L=1)"),
+        ]
+        axis.legend(handles=ratio_handles, loc="best", fontsize=7.5, frameon=False,
+                    handlelength=3.2)
 
     def log_log_slope(condition: str, eval_l: int, state: str, segment: int) -> float:
         lags, values = seed1_curve(condition, eval_l, state, segment)
@@ -351,13 +400,11 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         return float(np.polyfit(np.log2(lags[defined]), np.log2(values[defined]), 1)[0])
 
     hierarchical = (
-        # Deliberately distinct from the blue/orange/green/red segment palette
-        # used by the first six panels: color means model in the slope panels.
-        ("HRM", condition_name("easy", "hrm"), 6, "#6f00ff"),
-        ("TRM", condition_name("easy", "trm"), 6, "#008b8b"),
-        ("H2L1", condition_name("easy", "hrm_h2l1"), 1, "#d89000"),
+        ("HRM (L=6)", condition_name("easy", "hrm"), 6, model_colors["hrm"]),
+        ("TRM (L=6)", condition_name("easy", "trm"), 6, model_colors["trm"]),
+        ("HRM (L=1)", condition_name("easy", "hrm_h2l1"), 1, model_colors["hrm_l1"]),
     )
-    model_markers = {"HRM": "o", "TRM": "s", "H2L1": "D"}
+    model_markers = {"HRM (L=6)": "o", "TRM (L=6)": "s", "HRM (L=1)": "D"}
 
     def slope_series(condition: str, eval_l: int, state: str) -> np.ndarray:
         return np.asarray([
@@ -369,15 +416,16 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         for label, condition, eval_l, color in hierarchical:
             axis.plot(
                 segments, slope_series(condition, eval_l, "h"), "-o", color=color,
-                linewidth=1.8, markersize=4,
+                linewidth=2.4, markersize=5,
             )
             axis.plot(
                 segments, slope_series(condition, eval_l, "l"), "--^", color=color,
-                markerfacecolor="white", linewidth=1.5, markersize=4,
+                dashes=(7, 3), markerfacecolor="white", markeredgewidth=1.2,
+                linewidth=2.2, markersize=5.5,
             )
         rt_condition = condition_name("easy", "rt")
         axis.plot(
-            segments, slope_series(rt_condition, 1, "rt"), ":s", color="#222222",
+            segments, slope_series(rt_condition, 1, "rt"), ":s", color=model_colors["rt"],
             linewidth=1.8, markersize=4,
         )
         axis.axhline(0, color="0.5", linestyle=":", linewidth=1)
@@ -391,7 +439,7 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
             for label, _, _, color in hierarchical
         ]
         model_handles.append(
-            Line2D([0], [0], color="#222222", linestyle=":", linewidth=2, label="RT")
+            Line2D([0], [0], color=model_colors["rt"], linestyle=":", linewidth=2, label="RT")
         )
         axis.legend(handles=model_handles, ncol=2, fontsize=7, frameon=False,
                     columnspacing=.9, handlelength=2.2)
@@ -424,41 +472,55 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         raise ValueError(f"K55 plotting requires one shared section layout, got {stored_boundaries}.")
     boundary_points = next(iter(stored_boundaries))
     boundaries = tuple(zip(boundary_points[:-1], boundary_points[1:]))
+    neutral_segment_colors = ("#b8b8b8", "#949494", "#707070", "#4c4c4c")
     segment_handles = [
-        Line2D([0], [0], color=segment_colors(segment), linewidth=2,
+        Line2D([0], [0], color=neutral_segment_colors[segment], linewidth=3,
                label=f"S{segment + 1}  {start}–{end}")
         for segment, (start, end) in enumerate(boundaries)
     ]
     state_handles = [
-        Line2D([0], [0], color="#555555", linestyle="-", marker="o", linewidth=2, label="H"),
-        Line2D([0], [0], color="#555555", linestyle="--", marker="^", markerfacecolor="white",
-               linewidth=1.8, label="L"),
-        Line2D([0], [0], color="#222222", linestyle=":", marker="s", linewidth=1.9, label="RT state"),
+        Line2D([0], [0], color="#333333", linestyle="-", marker="o", markersize=6.5,
+               markerfacecolor="#333333", linewidth=2.8, label="H"),
+        Line2D([0], [0], color="#333333", linestyle=(0, (7, 3)), marker="^", markersize=7,
+               markerfacecolor="white", markeredgewidth=1.3, linewidth=2.5, label="L"),
+        Line2D([0], [0], color="#444444", linestyle=":", marker="s", linewidth=2.2,
+               label="RT state"),
     ]
     for primary_eval_l in (6, 8, 16, 32):
         hierarchical = (
-            ("HRM", condition_name("easy", "hrm"), primary_eval_l, "#6f00ff"),
-            ("TRM", condition_name("easy", "trm"), primary_eval_l, "#008b8b"),
-            ("H2L1", condition_name("easy", "hrm_h2l1"), 1, "#d89000"),
+            (f"HRM (L={primary_eval_l})", condition_name("easy", "hrm"), primary_eval_l,
+             model_colors["hrm"]),
+            (f"TRM (L={primary_eval_l})", condition_name("easy", "trm"), primary_eval_l,
+             model_colors["trm"]),
+            ("HRM (L=1)", condition_name("easy", "hrm_h2l1"), 1, model_colors["hrm_l1"]),
         )
+        model_markers = {
+            f"HRM (L={primary_eval_l})": "o",
+            f"TRM (L={primary_eval_l})": "s",
+            "HRM (L=1)": "D",
+        }
         figure, axes = plt.subplots(2, 4, figsize=(16, 8))
         configure_msd_axis(
-            axes[0, 0], condition_name("easy", "hrm"), primary_eval_l,
+            axes[0, 0], condition_name("easy", "hrm"), primary_eval_l, "hrm",
             f"HRM (L={primary_eval_l})",
         )
         configure_msd_axis(
-            axes[0, 1], condition_name("easy", "trm"), primary_eval_l,
+            axes[0, 1], condition_name("easy", "trm"), primary_eval_l, "trm",
             f"TRM (L={primary_eval_l})",
         )
-        configure_msd_axis(axes[0, 2], condition_name("easy", "hrm_h2l1"), 1, "H2L1 control")
+        configure_msd_axis(
+            axes[0, 2], condition_name("easy", "hrm_h2l1"), 1, "hrm_l1", "HRM (L=1)",
+        )
         configure_rt_axis(axes[0, 3])
         configure_ratio_axis(
             axes[1, 0], condition_name("easy", "hrm"), primary_eval_l,
-            "HRM", "MSD ratio: HRM vs H2L1",
+            "hrm", f"HRM (L={primary_eval_l})",
+            f"MSD ratio: HRM (L={primary_eval_l}) vs HRM (L=1)",
         )
         configure_ratio_axis(
             axes[1, 1], condition_name("easy", "trm"), primary_eval_l,
-            "TRM", "MSD ratio: TRM vs H2L1",
+            "trm", f"TRM (L={primary_eval_l})",
+            f"MSD ratio: TRM (L={primary_eval_l}) vs HRM (L=1)",
         )
         ratio_axes = list(axes[1, :2])
         ratio_limits = (
@@ -484,11 +546,14 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
 
         segment_legend = figure.legend(
             handles=segment_handles, loc="upper center", bbox_to_anchor=(.36, .945),
-            ncol=4, fontsize=8,
+            ncol=4, fontsize=8, title="Segment (L steps; light → dark)", title_fontsize=8,
+            frameon=False, handlelength=2.8,
         )
         figure.add_artist(segment_legend)
         figure.legend(
-            handles=state_handles, loc="upper center", bbox_to_anchor=(.76, .945), ncol=3, fontsize=8,
+            handles=state_handles, loc="upper center", bbox_to_anchor=(.76, .945), ncol=3,
+            fontsize=8, title="State / line style", title_fontsize=8, frameon=False,
+            handlelength=4.2, handletextpad=.7, columnspacing=1.5,
         )
         figure.suptitle("Deterministic long-rollout dynamics", y=.995)
         figure.tight_layout(rect=(0, 0, 1, .91))
@@ -496,8 +561,366 @@ def _comparison_figures(output_dir: Path, args: Any) -> None:
         if primary_eval_l != 6:
             stem += f"_L{primary_eval_l}"
         for suffix in ("png", "pdf"):
-            figure.savefig(output_dir / f"{stem}.{suffix}", dpi=200)
+            figure.savefig(output_dir / f"{stem}.{suffix}", dpi=300)
         plt.close(figure)
+
+    # A compact, claim-driven main-text figure.  Raw MSD panels establish the
+    # evidence, while slope and parity panels isolate the five conclusions.
+    segments = np.arange(1, 5)
+    hrm_h = slope_series(condition_name("easy", "hrm"), 6, "h")
+    hrm_l = slope_series(condition_name("easy", "hrm"), 6, "l")
+    rt_beta = slope_series(condition_name("easy", "rt"), 1, "rt")
+
+    def matched_log_msd(
+        left_condition: str, left_l: int, left_state: str,
+        right_condition: str, right_l: int, right_state: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        left_points: list[np.ndarray] = []
+        right_points: list[np.ndarray] = []
+        for segment in range(4):
+            left_lags, left_values = seed1_curve(left_condition, left_l, left_state, segment)
+            right_lags, right_values = seed1_curve(right_condition, right_l, right_state, segment)
+            common, left_indices, right_indices = np.intersect1d(
+                left_lags, right_lags, return_indices=True,
+            )
+            if not len(common):
+                continue
+            defined = np.logical_and(left_values[left_indices] > 0, right_values[right_indices] > 0)
+            left_points.append(np.log2(left_values[left_indices][defined]))
+            right_points.append(np.log2(right_values[right_indices][defined]))
+        return np.concatenate(left_points), np.concatenate(right_points)
+
+    hrm_trm_h = matched_log_msd(
+        condition_name("easy", "hrm"), 6, "h", condition_name("easy", "trm"), 6, "h",
+    )
+    hrm_trm_l = matched_log_msd(
+        condition_name("easy", "hrm"), 6, "l", condition_name("easy", "trm"), 6, "l",
+    )
+    hrm_l1_rt_h = matched_log_msd(
+        condition_name("easy", "hrm_h2l1"), 1, "h", condition_name("easy", "rt"), 1, "rt",
+    )
+    hrm_l1_rt_l = matched_log_msd(
+        condition_name("easy", "hrm_h2l1"), 1, "l", condition_name("easy", "rt"), 1, "rt",
+    )
+
+    figure, axes = plt.subplots(1, 5, figsize=(19, 4.35))
+    h_handle = Line2D([0], [0], color="#333333", linewidth=2.3, marker="o", label="H")
+    l_handle = Line2D([0], [0], color="#333333", linewidth=2.1, linestyle=(0, (7, 3)),
+                      marker="^", markerfacecolor="white", label="L")
+
+    # (a) Complete HRM MSD curves expose the dual-timescale geometry directly.
+    axis = axes[0]
+    for segment in range(4):
+        color = model_segment_color("hrm", segment)
+        for state, linestyle, marker in (("h", "-", "o"), ("l", (0, (7, 3)), "^")):
+            lags, values = seed1_curve(condition_name("easy", "hrm"), 6, state, segment)
+            defined = values > 0
+            if state == "h":
+                defined &= lags >= 6
+            axis.plot(lags, np.where(defined, values, np.nan), color=color, linestyle=linestyle,
+                      marker=marker, markerfacecolor=color if state == "h" else "white",
+                      markeredgewidth=1, markersize=3.6, linewidth=2)
+    axis.set_xscale("log", base=2)
+    axis.set_yscale("log", base=2)
+    axis.set_xlabel("lag (L steps)")
+    axis.set_ylabel("per-coordinate MSD")
+    axis.set_title("(a) Dual-timescale MSD", loc="left", fontweight="bold")
+    axis.legend(handles=(h_handle, l_handle), frameon=False, fontsize=8,
+                loc="upper left", handlelength=3)
+    axis.text(.97, .05, "S1 → S4\nlight → dark", transform=axis.transAxes,
+              ha="right", va="bottom", fontsize=8)
+
+    # (b) Slopes summarize how the full trajectories evolve over rollout time.
+    axis = axes[1]
+    axis.plot(segments, hrm_h, "-o", color=model_colors["hrm"], linewidth=2.5,
+              markersize=5, label="H")
+    axis.plot(segments, hrm_l, color=model_colors["hrm"], linestyle=(0, (7, 3)), marker="^",
+              markerfacecolor="white", markeredgewidth=1.2, linewidth=2.2,
+              markersize=5.5, label="L")
+    axis.fill_between(segments, hrm_l, hrm_h, color=model_colors["hrm"], alpha=.10)
+    axis.set_xticks(segments, [f"S{segment}" for segment in segments])
+    axis.set_ylim(-.02, 1.0)
+    axis.set_xlabel("rollout segment")
+    axis.set_ylabel("log-log slope  β")
+    axis.set_title("(b) H retains mobility", loc="left", fontweight="bold")
+    axis.text(.05, .07, f"S4:  βH={hrm_h[-1]:.2f},  βL={hrm_l[-1]:.2f}",
+              transform=axis.transAxes, fontsize=8.5)
+    axis.legend(frameon=False, fontsize=8, handlelength=3, loc="upper right")
+
+    # (c) Complete trajectories show the smaller log-log slope of flat recurrence.
+    axis = axes[2]
+    for segment in range(4):
+        h_lags, h_values = seed1_curve(condition_name("easy", "hrm"), 6, "h", segment)
+        rt_lags, rt_values = seed1_curve(condition_name("easy", "rt"), 1, "rt", segment)
+        axis.plot(h_lags, np.where((h_values > 0) & (h_lags >= 6), h_values, np.nan),
+                  color=model_segment_color("hrm", segment), linewidth=2, marker="o",
+                  markersize=3.4)
+        axis.plot(rt_lags, np.where(rt_values > 0, rt_values, np.nan),
+                  color=model_segment_color("rt", segment), linewidth=2.1, linestyle=":",
+                  marker="s", markersize=3.3)
+    axis.set_xscale("log", base=2)
+    axis.set_yscale("log", base=2)
+    axis.set_xlabel("lag (L steps)")
+    axis.set_ylabel("per-coordinate MSD")
+    axis.set_title("(c) HRM outpaces RT", loc="left", fontweight="bold")
+    axis.text(.04, .05, "β(HRM-H) > β(RT)\nin 4/4 segments", transform=axis.transAxes,
+              fontsize=8.3, va="bottom")
+    axis.legend(handles=(
+        Line2D([0], [0], color=model_colors["hrm"], marker="o", linewidth=2.2, label="HRM (H)"),
+        Line2D([0], [0], color=model_colors["rt"], marker="s", linestyle=":",
+               linewidth=2.2, label="RT"),
+    ), frameon=False, fontsize=8, loc="upper left")
+
+    def configure_parity_axis(
+        axis: Any, h_points: tuple[np.ndarray, np.ndarray], l_points: tuple[np.ndarray, np.ndarray],
+        left_color: str, right_color: str, left_label: str, right_label: str, title: str,
+    ) -> None:
+        all_x = np.concatenate((h_points[0], l_points[0]))
+        all_y = np.concatenate((h_points[1], l_points[1]))
+        lower = math.floor(float(min(all_x.min(), all_y.min())))
+        upper = math.ceil(float(max(all_x.max(), all_y.max())))
+        axis.plot((lower, upper), (lower, upper), color="0.55", linestyle="--", linewidth=1.2,
+                  zorder=0)
+        axis.plot(h_points[0], h_points[1], linestyle="none", marker="o", fillstyle="left",
+                  markerfacecolor=left_color, markerfacecoloralt=right_color,
+                  markeredgecolor="0.25", markeredgewidth=.35, markersize=4, alpha=.55, label="H")
+        axis.plot(l_points[0], l_points[1], linestyle="none", marker="^", fillstyle="left",
+                  markerfacecolor=left_color, markerfacecoloralt=right_color,
+                  markeredgecolor="0.25", markeredgewidth=.35, markersize=4.3, alpha=.55, label="L")
+        correlation = float(np.corrcoef(all_x, all_y)[0, 1])
+        axis.set_xlim(lower, upper)
+        axis.set_ylim(lower, upper)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_xlabel(f"log₂ MSD: {left_label}")
+        axis.set_ylabel(f"log₂ MSD: {right_label}")
+        axis.set_title(title, loc="left", fontweight="bold")
+        axis.text(.05, .92, f"all lags:  r={correlation:.3f}", transform=axis.transAxes, fontsize=8.5)
+        axis.legend(frameon=False, fontsize=8, loc="lower right")
+
+    configure_parity_axis(
+        axes[3], hrm_trm_h, hrm_trm_l, model_colors["hrm"], model_colors["trm"],
+        "HRM", "TRM", "(d) HRM and TRM share dynamics",
+    )
+    configure_parity_axis(
+        axes[4], hrm_l1_rt_h, hrm_l1_rt_l, model_colors["hrm_l1"], model_colors["rt"],
+        "HRM (L=1)", "RT", "(e) HRM (L=1) resembles RT",
+    )
+
+    for axis in axes:
+        axis.grid(alpha=.18, linewidth=.7)
+        axis.spines[["top", "right"]].set_visible(False)
+    figure.suptitle("Dynamical signatures of dual-timescale recurrence", fontsize=14, y=1.02)
+    figure.tight_layout(w_pad=1.25)
+    for suffix in ("png", "pdf"):
+        figure.savefig(output_dir / f"dynamical_signatures_five_panel.{suffix}", dpi=300,
+                       bbox_inches="tight")
+    plt.close(figure)
+
+    # Companion robustness figure: retain the same visual argument, but replace
+    # the representative seed with the mean and min--max envelope over all
+    # three seeds.  Slopes are fitted within each seed before aggregation.
+    def three_seed_curve(
+        condition: str, eval_l: int, state: str, segment: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        lags, mean, _low, _high, seed_curves = curve(
+            metadata, condition, eval_l, state, segment,
+        )
+        stacked = np.asarray(seed_curves)
+        if stacked.shape[0] != 3:
+            raise ValueError(
+                f"Expected three seeds for {condition}/L{eval_l}, got {stacked.shape[0]}.",
+            )
+        return lags, mean, stacked.min(axis=0), stacked.max(axis=0), stacked
+
+    def seed_slope_series(condition: str, eval_l: int, state: str) -> np.ndarray:
+        by_segment: list[np.ndarray] = []
+        for segment in range(4):
+            lags, _mean, _low, _high, seed_curves = three_seed_curve(
+                condition, eval_l, state, segment,
+            )
+            slopes = []
+            for values in seed_curves:
+                defined = np.logical_and(values > 0, lags >= eval_l)
+                slopes.append(
+                    float(np.polyfit(np.log2(lags[defined]), np.log2(values[defined]), 1)[0])
+                    if np.count_nonzero(defined) >= 2 else math.nan
+                )
+            by_segment.append(np.asarray(slopes))
+        return np.asarray(by_segment).T
+
+    def plot_three_seed_msd(
+        axis: Any, condition: str, eval_l: int, state: str, model_name: str,
+        segment: int, *, linestyle: Any, marker: str, zorder: int,
+    ) -> None:
+        lags, mean, low, high, _seed_curves = three_seed_curve(
+            condition, eval_l, state, segment,
+        )
+        defined = mean > 0
+        if state == "h":
+            defined &= lags >= eval_l
+        color = model_segment_color(model_name, segment)
+        x = lags[defined]
+        y = mean[defined]
+        axis.fill_between(
+            x, np.maximum(low[defined], np.finfo(float).tiny), high[defined],
+            color=color, alpha=.13, linewidth=0, zorder=zorder - 1,
+        )
+        axis.plot(
+            x, y, color=color, linestyle=linestyle, marker=marker,
+            markerfacecolor=color if state in ("h", "rt") else "white",
+            markeredgecolor=color, markeredgewidth=1, markersize=3.6,
+            linewidth=2.1, zorder=zorder,
+        )
+
+    def matched_three_seed_log_msd(
+        left_condition: str, left_l: int, left_state: str,
+        right_condition: str, right_l: int, right_state: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        left_points: list[np.ndarray] = []
+        right_points: list[np.ndarray] = []
+        for segment in range(4):
+            left_lags, left_mean, _left_low, _left_high, _ = three_seed_curve(
+                left_condition, left_l, left_state, segment,
+            )
+            right_lags, right_mean, _right_low, _right_high, _ = three_seed_curve(
+                right_condition, right_l, right_state, segment,
+            )
+            common, left_indices, right_indices = np.intersect1d(
+                left_lags, right_lags, return_indices=True,
+            )
+            if not len(common):
+                continue
+            defined = np.logical_and(left_mean[left_indices] > 0, right_mean[right_indices] > 0)
+            left_points.append(np.log2(left_mean[left_indices][defined]))
+            right_points.append(np.log2(right_mean[right_indices][defined]))
+        return np.concatenate(left_points), np.concatenate(right_points)
+
+    hrm_h_seeds = seed_slope_series(condition_name("easy", "hrm"), 6, "h")
+    hrm_l_seeds = seed_slope_series(condition_name("easy", "hrm"), 6, "l")
+    hrm_h_mean = np.nanmean(hrm_h_seeds, axis=0)
+    hrm_l_mean = np.nanmean(hrm_l_seeds, axis=0)
+
+    three_hrm_trm_h = matched_three_seed_log_msd(
+        condition_name("easy", "hrm"), 6, "h", condition_name("easy", "trm"), 6, "h",
+    )
+    three_hrm_trm_l = matched_three_seed_log_msd(
+        condition_name("easy", "hrm"), 6, "l", condition_name("easy", "trm"), 6, "l",
+    )
+    three_hrm_l1_rt_h = matched_three_seed_log_msd(
+        condition_name("easy", "hrm_h2l1"), 1, "h",
+        condition_name("easy", "rt"), 1, "rt",
+    )
+    three_hrm_l1_rt_l = matched_three_seed_log_msd(
+        condition_name("easy", "hrm_h2l1"), 1, "l",
+        condition_name("easy", "rt"), 1, "rt",
+    )
+
+    figure, axes = plt.subplots(1, 5, figsize=(19, 4.35))
+
+    # (a) Three-seed mean complete HRM MSD curves with seed-range ribbons.
+    axis = axes[0]
+    for segment in range(4):
+        plot_three_seed_msd(
+            axis, condition_name("easy", "hrm"), 6, "h", "hrm", segment,
+            linestyle="-", marker="o", zorder=4,
+        )
+        plot_three_seed_msd(
+            axis, condition_name("easy", "hrm"), 6, "l", "hrm", segment,
+            linestyle=(0, (7, 3)), marker="^", zorder=2,
+        )
+    axis.set_xscale("log", base=2)
+    axis.set_yscale("log", base=2)
+    axis.set_xlabel("lag (L steps)")
+    axis.set_ylabel("per-coordinate MSD")
+    axis.set_title("(a) Dual-timescale MSD", loc="left", fontweight="bold")
+    axis.legend(handles=(h_handle, l_handle), frameon=False, fontsize=8,
+                loc="upper left", handlelength=3)
+    axis.text(.97, .05, "S1 → S4\nlight → dark", transform=axis.transAxes,
+              ha="right", va="bottom", fontsize=8)
+
+    # (b) Fit slopes per seed; error bars span the observed three-seed range.
+    axis = axes[1]
+    for values, mean, linestyle, marker, label in (
+        (hrm_h_seeds, hrm_h_mean, "-", "o", "H"),
+        (hrm_l_seeds, hrm_l_mean, (0, (7, 3)), "^", "L"),
+    ):
+        errors = np.vstack((mean - np.nanmin(values, axis=0), np.nanmax(values, axis=0) - mean))
+        axis.errorbar(
+            segments, mean, yerr=errors, color=model_colors["hrm"], linestyle=linestyle,
+            marker=marker, markerfacecolor=model_colors["hrm"] if label == "H" else "white",
+            markeredgewidth=1.2, linewidth=2.3, markersize=5.5, capsize=2.5,
+            elinewidth=1.2, label=label,
+        )
+    axis.fill_between(segments, hrm_l_mean, hrm_h_mean, color=model_colors["hrm"], alpha=.08)
+    axis.set_xticks(segments, [f"S{segment}" for segment in segments])
+    axis.set_ylim(-.02, 1.0)
+    axis.set_xlabel("rollout segment")
+    axis.set_ylabel("log-log slope  β")
+    axis.set_title("(b) H retains mobility", loc="left", fontweight="bold")
+    axis.text(.05, .07, f"S4:  βH={hrm_h_mean[-1]:.2f},  βL={hrm_l_mean[-1]:.2f}",
+              transform=axis.transAxes, fontsize=8.5)
+    axis.legend(frameon=False, fontsize=8, handlelength=3, loc="upper right")
+
+    # (c) Three-seed complete trajectories for the hierarchical and flat models.
+    axis = axes[2]
+    for segment in range(4):
+        plot_three_seed_msd(
+            axis, condition_name("easy", "hrm"), 6, "h", "hrm", segment,
+            linestyle="-", marker="o", zorder=4,
+        )
+        plot_three_seed_msd(
+            axis, condition_name("easy", "rt"), 1, "rt", "rt", segment,
+            linestyle=":", marker="s", zorder=2,
+        )
+    axis.set_xscale("log", base=2)
+    axis.set_yscale("log", base=2)
+    axis.set_xlabel("lag (L steps)")
+    axis.set_ylabel("per-coordinate MSD")
+    axis.set_title("(c) HRM outpaces RT", loc="left", fontweight="bold")
+    axis.legend(handles=(
+        Line2D([0], [0], color=model_colors["hrm"], marker="o", linewidth=2.2, label="HRM (H)"),
+        Line2D([0], [0], color=model_colors["rt"], marker="s", linestyle=":",
+               linewidth=2.2, label="RT"),
+    ), frameon=False, fontsize=8, loc="upper left")
+
+    configure_parity_axis(
+        axes[3], three_hrm_trm_h, three_hrm_trm_l,
+        model_colors["hrm"], model_colors["trm"],
+        "HRM", "TRM", "(d) HRM and TRM share dynamics",
+    )
+    configure_parity_axis(
+        axes[4], three_hrm_l1_rt_h, three_hrm_l1_rt_l,
+        model_colors["hrm_l1"], model_colors["rt"],
+        "HRM (L=1)", "RT", "(e) HRM (L=1) resembles RT",
+    )
+    three_hrm_trm_r = np.corrcoef(
+        np.concatenate((three_hrm_trm_h[0], three_hrm_trm_l[0])),
+        np.concatenate((three_hrm_trm_h[1], three_hrm_trm_l[1])),
+    )[0, 1]
+    three_hrm_l1_rt_r = np.corrcoef(
+        np.concatenate((three_hrm_l1_rt_h[0], three_hrm_l1_rt_l[0])),
+        np.concatenate((three_hrm_l1_rt_h[1], three_hrm_l1_rt_l[1])),
+    )[0, 1]
+    axes[3].texts[0].set_text(
+        f"3-seed mean:  r={three_hrm_trm_r:.3f}",
+    )
+    axes[4].texts[0].set_text(
+        f"3-seed mean:  r={three_hrm_l1_rt_r:.3f}",
+    )
+
+    for axis in axes:
+        axis.grid(alpha=.18, linewidth=.7)
+        axis.spines[["top", "right"]].set_visible(False)
+    figure.suptitle("Dynamical signatures across three seeds", fontsize=14, y=1.02)
+    figure.text(.5, -.005, "Lines: three-seed mean  ·  ribbons/error bars: seed min–max",
+                ha="center", va="top", fontsize=8.5, color="0.35")
+    figure.tight_layout(w_pad=1.25)
+    for suffix in ("png", "pdf"):
+        figure.savefig(
+            output_dir / f"dynamical_signatures_five_panel_3seed.{suffix}",
+            dpi=300, bbox_inches="tight",
+        )
+    plt.close(figure)
 
 
 def finalize_k55_l_depth(args: Any) -> None:
@@ -508,17 +931,24 @@ def finalize_k55_l_depth(args: Any) -> None:
     atomic_csv(args.output_dir / "h_over_l_ratio.csv", ratios, RATIO_FIELDS)
     _comparison_figures(args.output_dir, args)
     (args.output_dir / "analysis_metadata.json").write_text(json.dumps({
-        "profile": "k55-l-depth", "selection_split": args.k55_split,
+        "profile": "k55-l-depth", "epoch_selection_policy": args.k55_epoch_policy,
+        "selection_split": args.k55_split if args.k55_epoch_policy == "best" else None,
         "eval_l_values": args.l_depth_values, "seeds": args.core_seeds,
         "samples": args.samples, "sample_seed": args.sample_seed,
         "bootstrap_replicates": args.bootstrap_replicates, "max_l_updates": 4096,
         "lag_points": args.lag_points,
     }, indent=2) + "\n")
+    selection_description = (
+        f"The native best epoch was selected independently for every model/seed using "
+        f"`{args.k55_split}` exact match (earlier epoch wins a tie)."
+        if args.k55_epoch_policy == "best" else
+        "The highest numbered checkpoint present in every model/seed directory was selected; "
+        "no validation or test metric was used for epoch selection."
+    )
     (args.output_dir / "README.md").write_text(f"""# K55 inference-L MSD
 
-The native best epoch was selected independently for every model/seed using
-`{args.k55_split}` exact match (earlier epoch wins a tie). HRM and TRM are swept
-over inference L values `{','.join(map(str, args.l_depth_values))}`. H2L1-H and
+{selection_description} HRM and TRM are swept
+over inference L values `{','.join(map(str, args.l_depth_values))}`. HRM (L=1) and
 RT remain fixed controls. Every rollout uses 4,096 underlying recurrent updates;
 MSD is the per-puzzle, time-averaged, full-state per-coordinate squared
 displacement. `h_plus_l` includes the H/L displacement cross term, whereas
@@ -547,7 +977,10 @@ def main_k55_core(args: Any) -> None:
         runs = runs[args.shard_index::args.num_shards]
     if not runs:
         raise ValueError("This K55 selection shard received no runs.")
-    select_k55_best(runs, args.output_dir, args.device, args.k55_split)
+    if args.k55_epoch_policy == "last":
+        atomic_csv(args.output_dir / "best_checkpoints.csv", last_k55_checkpoints(runs), SELECTION_FIELDS)
+    else:
+        select_k55_best(runs, args.output_dir, args.device, args.k55_split)
 
 
 def merge_k55_l_depth(args: Any, all_units: list[SweepUnit]) -> None:
@@ -600,7 +1033,17 @@ def main_k55_l_depth(args: Any) -> None:
     if args.merge_from:
         merge_k55_l_depth(args, all_units)
         return
-    selected_rows = read_csv(args.reference_best_checkpoints)
+    selected_rows = (
+        last_k55_checkpoints(runs)
+        if args.k55_epoch_policy == "last"
+        else read_csv(args.reference_best_checkpoints)
+    )
+    if args.k55_epoch_policy == "best" and any(
+        row.get("selection_policy") == "last" for row in selected_rows
+    ):
+        raise ValueError(
+            "--k55-epoch-policy best cannot use a reference CSV produced by the last-epoch policy.",
+        )
     selected = {(row["condition"], int(row["seed"])): row for row in selected_rows}
     missing = sorted({(unit.run.condition, unit.run.seed) for unit in all_units} - set(selected))
     if missing:
@@ -633,6 +1076,8 @@ def main_k55_l_depth(args: Any) -> None:
             int(row["actual_l_updates"]) == updates
             and np.array_equal(recorded_boundaries, expected_boundaries)
             and cache_matches
+            and int(row["best_epoch"]) == int(selected[(unit.run.condition, unit.run.seed)]["epoch"])
+            and row["checkpoint"] == selected[(unit.run.condition, unit.run.seed)]["checkpoint"]
         ):
             completed.add(key)
     assigned = all_units[args.shard_index::args.num_shards] if args.shard_index is not None else all_units
@@ -669,4 +1114,7 @@ def main_k55_l_depth(args: Any) -> None:
         finalize_k55_l_depth(args)
 
 
-__all__ = ["discover_k55_runs", "k55_units", "main_k55_core", "main_k55_l_depth", "merge_k55_l_depth"]
+__all__ = [
+    "discover_k55_runs", "k55_units", "last_k55_checkpoints", "main_k55_core",
+    "main_k55_l_depth", "merge_k55_l_depth",
+]

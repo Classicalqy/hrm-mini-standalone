@@ -38,7 +38,7 @@ class CoreFiveLDepthProfileTest(unittest.TestCase):
         self.assertEqual(expected_h_updates(6), (682, 4))
         self.assertEqual(expected_h_updates(8), (512, 0))
         self.assertEqual(expected_h_updates(1024), (4, 0))
-        self.assertEqual(PHYSICAL_BOUNDARIES.tolist(), [0, 1024, 2048, 3072, 4096])
+        self.assertEqual(PHYSICAL_BOUNDARIES.tolist(), [0, 48, 192, 768, 4096])
 
     def test_units_cover_all_h2l6_schedules_and_fixed_controls(self) -> None:
         conditions = ("H2L1_h", "H2L6_h", "H2L6_l", "H2L6_hl", "RT")

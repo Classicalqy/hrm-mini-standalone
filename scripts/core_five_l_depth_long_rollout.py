@@ -45,12 +45,13 @@ L_DEPTH_COLORS = {
     64: "#66A61E", 128: "#E6AB02", 256: "#E76F51", 512: "#D73027",
     1024: "#8C510A",
 }
-PHYSICAL_BOUNDARIES = np.asarray((0, 1024, 2048, 3072, 4096), dtype=np.int64)
-SCHEME = "core_five_l_depth_physical_l_updates_v2"
+PHYSICAL_BOUNDARIES = np.asarray((0, 48, 192, 768, 4096), dtype=np.int64)
+SCHEME = "core_five_l_depth_physical_l_updates_v1"
 MIN_OUTER_SCHEME = "core_five_l_depth_min_outer16_v1"
 SELECTION_FIELDS = [
     "kind", "condition", "readout", "train_l", "seed", "epoch", "checkpoint",
-    "test_exact_match", "cell_accuracy", "evaluated_examples", "selection_completed",
+    "test_exact_match", "cell_accuracy", "evaluated_examples", "selection_policy",
+    "selection_completed",
 ]
 METADATA_FIELDS = [
     "kind", "condition", "readout", "train_l", "eval_l", "seed", "best_epoch", "checkpoint", "samples",

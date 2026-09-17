@@ -15,7 +15,13 @@ sys.modules.setdefault("coolname", coolname)
 from arch.trm import TRM
 from scripts.analyze_long_rollout_msd import RunDirectory
 from scripts.core_five_l_depth_long_rollout import advance_hrm_l, initial_hrm_state
-from scripts.k55_msd_profiles import discover_k55_runs, inferred_k55_config, k55_units, load_k55_config
+from scripts.k55_msd_profiles import (
+    discover_k55_runs,
+    inferred_k55_config,
+    k55_units,
+    last_k55_checkpoints,
+    load_k55_config,
+)
 from test_hrm_readout import tiny_config
 
 
@@ -86,6 +92,22 @@ class K55MSDProfilesTest(unittest.TestCase):
         self.assertEqual({unit.eval_l for unit in units if unit.run.condition.endswith("_hrm")}, {6, 8, 16})
         self.assertEqual({unit.eval_l for unit in units if unit.run.condition.endswith("_trm")}, {6, 8, 16})
         self.assertEqual({unit.eval_l for unit in units if unit.run.condition.endswith("_rt")}, {1})
+
+    def test_last_checkpoint_policy_uses_highest_epoch_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            seed_dir = Path(temporary) / "easy_k55_hrm" / "seed_1"
+            seed_dir.mkdir(parents=True)
+            for epoch in (0, 7, 19):
+                (seed_dir / f"epoch_{epoch}.pt").touch()
+            run = RunDirectory(
+                "hrm", "easy_k55_hrm", 1, seed_dir, None, 6, "h",  # type: ignore[arg-type]
+            )
+            selected = last_k55_checkpoints([run])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["epoch"], 19)
+        self.assertEqual(Path(str(selected[0]["checkpoint"])).name, "epoch_19.pt")
+        self.assertEqual(selected[0]["selection_policy"], "last")
+        self.assertEqual(selected[0]["test_exact_match"], "")
 
     def test_discovery_accepts_exact_requested_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
